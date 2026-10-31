@@ -5,7 +5,7 @@ function parseSerialLine(raw) {
   const line = raw.trim();
   if (!line) return null;
 
-  // 1. Try pure JSON format
+  // 1. Try pure JSON format: {"heel":1200,"outer":850,"inner":900,"toe":450}
   if (line.startsWith("{") && line.endsWith("}")) {
     try {
       const obj = JSON.parse(line);
@@ -20,7 +20,7 @@ function parseSerialLine(raw) {
     }
   }
 
-  // 2. Try key-value format (e.g. Heel:1200,Outer:850,Inner:900,Toe:450)
+  // 2. Try Serial Plotter / key-value format (e.g. Heel:1200,Outer:850,Inner:900,Toe:450)
   const h = line.match(/heel[:=]\s*(\d+)/i);
   const o = line.match(/(?:outer|rightball|right_ball)[:=]\s*(\d+)/i);
   const i = line.match(/(?:inner|leftball|left_ball)[:=]\s*(\d+)/i);
@@ -42,42 +42,36 @@ function startSerialBridge({ portName = "COM9", baudRate = 115200, onData, log =
   let child = null;
   let running = true;
   let retryTimer = null;
-  let hasLoggedWaiting = false;
+  let isConnected = false;
 
   const psScript = `
 $ErrorActionPreference = 'SilentlyContinue'
-$targetPort = '${portName}'
+$portName = '${portName}'
 
 # Check if target port exists
 $available = [System.IO.Ports.SerialPort]::GetPortNames()
-if ($available -notcontains $targetPort) {
-  # If target not found, check if there's any CH340 / USB Serial port
-  $usbPort = $available | Where-Object { $_ -ne 'COM1' -and $_ -ne 'COM2' } | Select-Object -First 1
-  if ($usbPort) {
-    $targetPort = $usbPort
-  } else {
-    [Console]::WriteLine("[NO_PORT]")
-    exit 0
-  }
+if ($available -notcontains $portName) {
+  [Console]::WriteLine("[NO_PORT]")
+  exit 0
 }
 
 try {
-  $sp = New-Object System.IO.Ports.SerialPort $targetPort, ${baudRate}, 'None', 8, 'One'
-  $sp.ReadTimeout = 2500
+  $sp = New-Object System.IO.Ports.SerialPort $portName, ${baudRate}, 'None', 8, 'One'
+  $sp.ReadTimeout = 2000
   $sp.Open()
-  [Console]::WriteLine("[CONNECTED:" + $targetPort + "]")
+  [Console]::WriteLine("[CONNECTED]")
   while ($sp.IsOpen) {
     try {
       $line = $sp.ReadLine()
       if ($line) { [Console]::WriteLine($line) }
     } catch [System.TimeoutException] {
-      # Expected timeout when idle, continue listening
+      # Timeout is expected when no data is sent; keep listening
     } catch {
       break
     }
   }
 } catch {
-  [Console]::WriteLine("[BUSY:" + $targetPort + "]")
+  [Console]::WriteLine("[BUSY]")
 } finally {
   if ($sp -and $sp.IsOpen) { $sp.Close() }
 }
@@ -101,23 +95,16 @@ try {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
-        if (trimmed.startsWith("[CONNECTED:")) {
-          const activePort = trimmed.slice(11, -1);
-          log(`[wired-usb] Connected to ESP32 on ${activePort} (${baudRate} baud)`);
-          hasLoggedWaiting = false;
-          continue;
-        }
-
-        if (trimmed === "[NO_PORT]") {
-          if (!hasLoggedWaiting) {
-            log(`[wired-usb] Waiting for ESP32 USB cable to be plugged in...`);
-            hasLoggedWaiting = true;
+        if (trimmed === "[CONNECTED]") {
+          if (!isConnected) {
+            log(`[wired-usb] Connected to ESP32 on ${portName} (${baudRate} baud)`);
+            isConnected = true;
           }
           continue;
         }
 
-        if (trimmed.startsWith("[BUSY:")) {
-          // Port is busy (e.g. Arduino IDE is flashing)
+        if (trimmed === "[NO_PORT]" || trimmed === "[BUSY]") {
+          isConnected = false;
           continue;
         }
 
@@ -130,15 +117,17 @@ try {
 
     child.on("close", () => {
       child = null;
+      isConnected = false;
       if (running) {
-        // Sleep 4 seconds before checking again (low CPU, clean polling)
-        retryTimer = setTimeout(launch, 4000);
+        // Quietly retry every 3 seconds without flooding terminal
+        retryTimer = setTimeout(launch, 3000);
       }
     });
 
     child.on("error", () => {
+      isConnected = false;
       if (running) {
-        retryTimer = setTimeout(launch, 4000);
+        retryTimer = setTimeout(launch, 3000);
       }
     });
   }
